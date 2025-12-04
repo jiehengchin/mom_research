@@ -3,24 +3,32 @@ import numpy as np
 import os
 import glob
 from typing import Dict, List, Optional
-from portwine.loaders.base import MarketDataLoader
 from numba import jit, prange
 
-class BinanceDataLoader(MarketDataLoader):
+
+class BinanceDataLoader:
     """
     Data loader for Binance individual parquet files designed for cross-sectional strategies.
     
     This loader reads individual ticker parquet files from Binance API data and creates
     a unified interface compatible with existing momentum strategies.
+    Symbols can become eligible dynamically: they only need to exceed the rolling
+    volume threshold for `activation_min_days`, rather than relying on a lifetime
+    average.
     
     Parameters:
     -----------
     data_directory : str
-        Directory containing individual ticker parquet files (format: SYMBOLUSDT-1d-data.parquet)
+        Directory containing individual ticker parquet files (format: SYMBOLUSDT-<timeframe>-data.parquet)
+    timeframe : str, default "1d"
+        Candle interval to load (e.g., "1d", "4h"). Defaults to daily data.
     min_records : int, default 252
         Minimum number of records required for a cryptocurrency to be included
     min_volume : float, optional  
-        Minimum average volume threshold for inclusion (Binance has no market cap data)
+        Rolling 30-day volume threshold (USD) for activation.
+    activation_min_days : int, default 30
+        Minimum number of days where the rolling volume must exceed min_volume
+        for a ticker to enter the universe (allows assets to activate over time).
     start_date : str, optional
         Start date for data filtering (YYYY-MM-DD format)
     end_date : str, optional
@@ -29,18 +37,24 @@ class BinanceDataLoader(MarketDataLoader):
     
     def __init__(self, 
                  data_directory: str,
+                 timeframe: str = "1d",
                  min_records: int = 252,
                  min_volume: Optional[float] = None,
+                 activation_min_days: int = 30,
                  start_date: Optional[str] = None,
                  end_date: Optional[str] = None,
                  funding_rate_directory: Optional[str] = None):
-        super().__init__()
         self.data_directory = data_directory
+        self.timeframe = timeframe.lower()
         self.min_records = min_records
         self.min_volume = min_volume
+        self.activation_min_days = activation_min_days
         self.start_date = pd.to_datetime(start_date) if start_date else None
         self.end_date = pd.to_datetime(end_date) if end_date else None
         self.funding_rate_directory = funding_rate_directory
+        self._timeframe_delta = self._parse_timeframe(self.timeframe)
+        self._volume_lookback_bars = self._compute_volume_lookback_bars()
+        self._activation_min_periods = self._compute_activation_min_periods()
         
         # Data storage (compatible with CMC loader interface)
         self._raw_data = None
@@ -54,29 +68,89 @@ class BinanceDataLoader(MarketDataLoader):
         self._load_data()
         if self.funding_rate_directory:
             self._load_funding_rates()
+
+    def _parse_timeframe(self, timeframe: str) -> Optional[pd.Timedelta]:
+        """Convert a timeframe string like '1d' or '4h' into a Timedelta."""
+        try:
+            delta = pd.to_timedelta(timeframe)
+        except Exception:
+            print(f"Warning: Could not parse timeframe '{timeframe}', falling back to daily assumptions.")
+            return None
+
+        if delta <= pd.Timedelta(0):
+            print(f"Warning: Non-positive timeframe '{timeframe}', falling back to daily assumptions.")
+            return None
+
+        return delta
+
+    def _compute_volume_lookback_bars(self, window_days: int = 30) -> int:
+        """Translate a 30-day lookback into bars for the chosen timeframe."""
+        if self._timeframe_delta is None:
+            return window_days
+
+        periods = int(np.ceil(pd.Timedelta(days=window_days) / self._timeframe_delta))
+        return max(periods, 1)
+
+    def _compute_activation_min_periods(self) -> int:
+        """
+        Convert activation_min_days into the equivalent number of bars so that
+        the threshold retains its day-based meaning across timeframes.
+        """
+        if self._timeframe_delta is None:
+            return self.activation_min_days
+
+        periods_per_day = pd.Timedelta(days=1) / self._timeframe_delta
+        periods_per_day = max(int(np.floor(periods_per_day)), 1)
+        return max(self.activation_min_days * periods_per_day, 1)
+
+    def _find_parquet_files(self) -> List[str]:
+        """Locate parquet files for the configured timeframe."""
+        patterns = [
+            os.path.join(self.data_directory, f"*USDT-{self.timeframe}-data.parquet"),
+            os.path.join(self.data_directory, f"*USDT-{self.timeframe}.parquet")
+        ]
+
+        if self.timeframe in ("1d", "1day"):
+            patterns.append(os.path.join(self.data_directory, "*USDT.parquet"))
+
+        parquet_files = []
+        for pattern in patterns:
+            parquet_files.extend(glob.glob(pattern))
+
+        return sorted(set(parquet_files))
     
     def _load_data(self):
         """Load all individual parquet files and create unified structure."""
-        print(f"Loading Binance data from {self.data_directory}...")
+        print(f"Loading Binance data from {self.data_directory} (timeframe={self.timeframe})...")
         
-        # Find all parquet files
-        pattern = os.path.join(self.data_directory, "*USDT-1d-data.parquet")
-        parquet_files = glob.glob(pattern)
-        
+        parquet_files = self._find_parquet_files()
+
         if not parquet_files:
-            raise ValueError(f"No USDT parquet files found in {self.data_directory}")
+            raise ValueError(f"No USDT parquet files found in {self.data_directory} for timeframe '{self.timeframe}'")
         
         print(f"Found {len(parquet_files)} USDT trading pairs")
         
         # Track loading statistics
         loaded_count = 0
         filtered_count = 0
+        volume_lookback = self._volume_lookback_bars
+        print(f"Using a {volume_lookback}-bar rolling window for 30d volume checks")
         
         for file_path in parquet_files:
             try:
                 # Extract symbol from filename
                 filename = os.path.basename(file_path)
-                symbol = filename.replace('-1d-data.parquet', '').strip()
+
+                suffixes = [
+                    f"-{self.timeframe}-data.parquet",
+                    f"-{self.timeframe}.parquet",
+                    ".parquet"
+                ]
+                symbol = filename
+                for suffix in suffixes:
+                    if symbol.endswith(suffix):
+                        symbol = symbol.replace(suffix, '').strip()
+                        break
                 
                 # Skip futures contracts and weird symbols
                 if any(skip in symbol for skip in ['_250926', '_251226', 'BTCDOM']):
@@ -88,13 +162,24 @@ class BinanceDataLoader(MarketDataLoader):
                 if df.empty:
                     continue
                 
-                # Ensure timestamp index
-                if 'timestamp' not in df.index.names:
+                # Ensure timestamp/date index
+                index_names = [name for name in df.index.names if name]
+
+                if ('timestamp' not in index_names) and ('date' not in index_names):
                     if 'timestamp' in df.columns:
                         df = df.set_index('timestamp')
+                    elif 'date' in df.columns:
+                        df = df.set_index('date')
                     else:
-                        print(f"Warning: {symbol} has no timestamp index or column")
+                        print(f"Warning: {symbol} has no timestamp/date index or column")
                         continue
+
+                # Normalize index to datetime
+                try:
+                    df.index = pd.to_datetime(df.index)
+                except Exception:
+                    print(f"Warning: {symbol} index could not be converted to datetime")
+                    continue
                 
                 # Apply date filters
                 if self.start_date is not None:
@@ -114,12 +199,12 @@ class BinanceDataLoader(MarketDataLoader):
                     dollar_volume = df['volume']
 
                 df['volume'] = dollar_volume
-                df['volume_30d'] = dollar_volume.rolling(30, min_periods=1).mean()
+                df['volume_30d'] = dollar_volume.rolling(volume_lookback, min_periods=1).mean()
 
                 # Apply minimum volume filter after conversion (works in dollar terms)
                 if self.min_volume is not None:
-                    avg_volume = df['volume'].mean()
-                    if avg_volume < self.min_volume:
+                    active_periods = (df['volume_30d'] >= self.min_volume).sum()
+                    if active_periods < self._activation_min_periods:
                         filtered_count += 1
                         continue
                 
@@ -283,7 +368,7 @@ class BinanceDataLoader(MarketDataLoader):
     def get_daily_data(self, date: pd.Timestamp, tickers: Optional[List[str]] = None) -> Dict[str, pd.Series]:
         """
         Get daily OHLCV data for specified date and tickers.
-        Compatible with portwine backtester interface.
+        Compatible with the existing backtester interface.
         """
         if tickers is None:
             tickers = self.get_universe()
@@ -323,7 +408,7 @@ class BinanceDataLoader(MarketDataLoader):
         return daily_data
     
     def load_ticker(self, ticker: str) -> Optional[pd.DataFrame]:
-        """Load data for a specific ticker (required by portwine MarketDataLoader interface)."""
+        """Load data for a specific ticker (legacy MarketDataLoader-compatible signature)."""
         if ticker not in self._crypto_universe:
             return None
         
@@ -335,7 +420,7 @@ class BinanceDataLoader(MarketDataLoader):
         if self.end_date is not None:
             data = data[data.index <= self.end_date]
         
-        # Ensure required columns are present for portwine
+        # Ensure required columns are present for downstream strategies
         required_cols = ['open', 'high', 'low', 'close', 'volume']
         if not all(col in data.columns for col in required_cols):
             print(f"Warning: {ticker} missing required columns")
@@ -345,7 +430,7 @@ class BinanceDataLoader(MarketDataLoader):
     
     def get_data_for_ticker(self, ticker: str, start_date: Optional[pd.Timestamp] = None, 
                            end_date: Optional[pd.Timestamp] = None) -> pd.DataFrame:
-        """Get data for a specific ticker (compatible with portwine interface)."""
+        """Get data for a specific ticker (compatible with the legacy loader interface)."""
         if ticker not in self._crypto_universe:
             return pd.DataFrame()
         
