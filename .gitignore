@@ -110,8 +110,6 @@ walkforward_results_sharpe.csv
 walkforward_results_sortino.csv
 walkforward_results_zvol.csv
 walkforward_results.csv
-.gitignore
-backtest_framework.py
 binance_data_loader.py
 frontrun_mom_btc.ipynb
 frontrun_mom_eth.ipynb
@@ -129,3 +127,6 @@ simple_mom_bt_quantile.ipynb
 simple_mom_bt_quantile_3d_params_filter.ipynb
 simple_mom_bt_quantile_3d_params.ipynb
 simple_mom_bt_quantile.ipynb
+walkforward_validation_ID_filter_1D_fast.ipynb
+figures/btc_vol_vs_strategy_return_t.png
+figures/btc_vol_vs_strategy_return_t1.png
