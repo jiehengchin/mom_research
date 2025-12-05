@@ -607,7 +607,7 @@ class WalkForwardRunner:
         sharpe = compute_sharpe(ret, periods_per_year=self.periods_per_year)
         return params, score, sharpe
 
-    def run(self) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+    def run(self) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
         all_dates = self.bundle.dates
         total = len(all_dates)
         if self.train_span >= total:
@@ -616,6 +616,7 @@ class WalkForwardRunner:
         wf_results: List[Dict[str, Any]] = []
         oos_returns: List[float] = []
         oos_dates: List[pd.Timestamp] = []
+        all_positions: List[pd.DataFrame] = []
 
         iteration = 0
         current_end = self.train_span
@@ -630,6 +631,10 @@ class WalkForwardRunner:
             train_end = current_end  # inclusive
             test_start = current_end
             test_end = min(current_end + self.test_span, total) - 1  # inclusive
+            train_start_ts = pd.to_datetime(all_dates[train_start])
+            train_end_ts = pd.to_datetime(all_dates[train_end])
+            test_start_ts = pd.to_datetime(all_dates[test_start])
+            test_end_ts = pd.to_datetime(all_dates[test_end])
 
             if test_end <= test_start:
                 break
@@ -670,15 +675,31 @@ class WalkForwardRunner:
                 volume_pct=getattr(best["params"], "volume_pct", 0.2),
                 tc_bps=getattr(best["params"], "tc_bps", 5.0),
             )
-            _, full_ret, _, _, _ = engine.run(start_idx=0, end_idx=test_end, collect_ic=False)
+            _, full_ret, _, _, pos_df = engine.run(start_idx=0, end_idx=test_end, collect_ic=False)
             test_dates = all_dates[test_start : test_end + 1]
             oos_ret = full_ret.reindex(pd.to_datetime(test_dates)).dropna()
+            oos_positions = pd.DataFrame()
 
             if not oos_ret.empty:
                 oos_returns.extend(oos_ret.values.tolist())
                 oos_dates.extend(oos_ret.index.tolist())
                 oos_sharpe = compute_sharpe(oos_ret, periods_per_year=self.periods_per_year)
                 oos_score = select_score(oos_ret, None, self.score_mode, periods_per_year=self.periods_per_year)
+                if pos_df is not None and not pos_df.empty and "date" in pos_df.columns:
+                    pos_df = pos_df.copy()
+                    pos_df["date"] = pd.to_datetime(pos_df["date"])
+                    oos_positions = pos_df[
+                        (pos_df["date"] >= test_start_ts) & (pos_df["date"] <= test_end_ts)
+                    ]
+                    oos_positions = oos_positions[oos_positions["date"].isin(oos_ret.index)]
+                    if not oos_positions.empty:
+                        oos_positions = oos_positions.copy()
+                        oos_positions["iteration"] = iteration
+                        oos_positions["train_start"] = train_start_ts
+                        oos_positions["train_end"] = train_end_ts
+                        oos_positions["test_start"] = test_start_ts
+                        oos_positions["test_end"] = test_end_ts
+                        all_positions.append(oos_positions)
             else:
                 oos_sharpe = float("nan")
                 oos_score = float("nan")
@@ -686,10 +707,10 @@ class WalkForwardRunner:
             wf_results.append(
                 {
                     "iteration": iteration,
-                    "train_start": pd.to_datetime(all_dates[train_start]),
-                    "train_end": pd.to_datetime(all_dates[train_end]),
-                    "test_start": pd.to_datetime(all_dates[test_start]),
-                    "test_end": pd.to_datetime(all_dates[test_end]),
+                    "train_start": train_start_ts,
+                    "train_end": train_end_ts,
+                    "test_start": test_start_ts,
+                    "test_end": test_end_ts,
                     "train_bars": train_end - train_start + 1,
                     "test_bars": test_end - test_start + 1,
                     "best_params": best["params"],
@@ -706,7 +727,8 @@ class WalkForwardRunner:
         combined_oos_returns = pd.Series(oos_returns, index=pd.to_datetime(oos_dates), name="OOS_Returns")
         combined_oos_returns = combined_oos_returns[~combined_oos_returns.index.duplicated(keep="first")].sort_index()
         combined_equity = (1 + combined_oos_returns).cumprod()
-        return wf_df, combined_oos_returns, combined_equity
+        positions_df = pd.concat(all_positions, ignore_index=True) if all_positions else pd.DataFrame()
+        return wf_df, combined_oos_returns, combined_equity, positions_df
 
     def report(
         self,
