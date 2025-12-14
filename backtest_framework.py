@@ -133,6 +133,8 @@ class MomentumIDParams:
     vol_window: int
     volume_pct: float = 0.2
     momentum_pct: float = 0.1
+    momentum_mode: str = "absolute"  # "absolute" (default) or "relative" (demeaned cross-section)
+    weighting_method: str = "vol"
     long_id_threshold: float = 0.0
     short_id_threshold: float = 0.0
     max_positions_per_side: int = 10
@@ -156,8 +158,18 @@ class MomentumIDStrategy(Strategy):
         bundle.ensure_vol_matrix([self.params.vol_window])
 
     def signals(self, idx: int, bundle: DataBundle) -> Dict[str, np.ndarray]:
+        alpha_row = bundle.simple_rets[self.params.simple_window][idx]
+        if (self.params.momentum_mode or "absolute").lower() == "relative":
+            finite = np.isfinite(alpha_row)
+            if finite.any():
+                mean_val = alpha_row[finite].mean()
+                alpha = alpha_row - mean_val
+            else:
+                alpha = alpha_row.copy()
+        else:
+            alpha = alpha_row
         return {
-            "alpha": bundle.simple_rets[self.params.simple_window][idx],
+            "alpha": alpha,
             "id": bundle.id_matrix[self.params.id_window][idx],
         }
 
@@ -180,7 +192,12 @@ class WeightingModel:
 
 class LongShortVolWeighting(WeightingModel):
     """
-    Long/short top-k weighting with 1/vol scaling and ID filters.
+    Long/short top-k weighting with selectable weighting method and ID filters.
+    Supported weighting_method values:
+    - "vol": inverse-vol scaling (default, previous behavior)
+    - "equal": equal weights within each side
+    - "alpha": weights proportional to alpha magnitude within each side
+    - "alpha_over_vol": weights proportional to alpha divided by rolling vol
     """
 
     def weights(
@@ -191,6 +208,7 @@ class LongShortVolWeighting(WeightingModel):
         universe_mask: np.ndarray,
         params: MomentumIDParams,
     ) -> np.ndarray:
+        method = (getattr(params, "weighting_method", "vol") or "vol").lower()
         alpha = signals["alpha"]
         id_vals = signals.get("id")
         vol_row = bundle.vol_matrix[params.vol_window][idx]
@@ -231,42 +249,51 @@ class LongShortVolWeighting(WeightingModel):
         long_assets = available[long_idx]
         short_assets = available[short_idx]
 
-        long_vols = np.where(vol_row[long_assets] <= 0, EPS, vol_row[long_assets])
-        short_vols = np.where(vol_row[short_assets] <= 0, EPS, vol_row[short_assets])
+        def side_base_weights(assets: np.ndarray, side: str) -> np.ndarray:
+            if assets.size == 0:
+                return np.array([], dtype=float)
+            if method == "vol":
+                vols = np.where(vol_row[assets] <= 0, EPS, vol_row[assets])
+                return 1.0 / vols
+            if method == "equal":
+                return np.ones(assets.size, dtype=float)
+            if method == "alpha":
+                if side == "long":
+                    return np.maximum(alpha[assets], 0)
+                return np.maximum(-alpha[assets], 0)
+            if method == "alpha_over_vol":
+                vols = np.where(vol_row[assets] <= 0, EPS, vol_row[assets])
+                if side == "long":
+                    return np.maximum(alpha[assets], 0) / vols
+                return np.maximum(-alpha[assets], 0) / vols
+            raise ValueError(f"Unsupported weighting_method: {method}")
 
-        lw = 1.0 / long_vols
-        sw = 1.0 / short_vols
+        def finalize_weights(base_w: np.ndarray, assets: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            base_w = np.nan_to_num(base_w, nan=0.0, posinf=0.0, neginf=0.0)
+            if base_w.size == 0 or base_w.sum() <= 0:
+                return np.array([], dtype=float), np.array([], dtype=int)
+            base_w /= base_w.sum()
+            base_w = np.minimum(base_w, params.max_position_cap)
+            keep = base_w >= params.min_weight
+            base_w = base_w[keep]
+            assets = assets[keep]
+            if base_w.size == 0 or base_w.sum() <= 0:
+                return np.array([], dtype=float), np.array([], dtype=int)
+            base_w /= base_w.sum()
+            return base_w, assets
 
-        lw = np.nan_to_num(lw, nan=EPS, posinf=EPS, neginf=EPS)
-        sw = np.nan_to_num(sw, nan=EPS, posinf=EPS, neginf=EPS)
-
-        if lw.sum() <= 0 or sw.sum() <= 0:
-            return np.zeros_like(alpha)
-
-        lw /= lw.sum()
-        sw /= sw.sum()
-
-        lw = np.minimum(lw, params.max_position_cap)
-        sw = np.minimum(sw, params.max_position_cap)
-
-        lw_keep = lw >= params.min_weight
-        sw_keep = sw >= params.min_weight
-
-        lw = lw[lw_keep]
-        sw = sw[sw_keep]
-        long_assets = long_assets[lw_keep]
-        short_assets = short_assets[sw_keep]
+        lw_raw = side_base_weights(long_assets, "long")
+        sw_raw = side_base_weights(short_assets, "short")
+        lw, long_assets = finalize_weights(lw_raw, long_assets)
+        sw, short_assets = finalize_weights(sw_raw, short_assets)
 
         if lw.size == 0 or sw.size == 0:
             return np.zeros_like(alpha)
 
-        lw /= lw.sum()
-        sw /= sw.sum()
-
         lw *= 0.5
         sw *= 0.5
 
-        weights = np.zeros_like(alpha)
+        weights = np.zeros_like(alpha, dtype=float)
         weights[long_assets] = lw
         weights[short_assets] = -sw
         return weights
@@ -810,6 +837,7 @@ class WalkForwardRunner:
             best_params_df["best_momentum_pct"] = best_params_df["best_params"].apply(lambda p: getattr(p, "momentum_pct", None))
             best_params_df["best_long_id_threshold"] = best_params_df["best_params"].apply(lambda p: getattr(p, "long_id_threshold", None))
             best_params_df["best_short_id_threshold"] = best_params_df["best_params"].apply(lambda p: getattr(p, "short_id_threshold", None))
+            best_params_df["best_weighting_method"] = best_params_df["best_params"].apply(lambda p: getattr(p, "weighting_method", None))
 
             print("Simple window selection:", best_params_df["best_simple_window"].value_counts().sort_index())
             print("Vol window selection:", best_params_df["best_vol_window"].value_counts().sort_index())
@@ -817,6 +845,7 @@ class WalkForwardRunner:
             print("Momentum pct selection:", best_params_df["best_momentum_pct"].value_counts().sort_index())
             print("Long ID threshold selection:", best_params_df["best_long_id_threshold"].value_counts().sort_index())
             print("Short ID threshold selection:", best_params_df["best_short_id_threshold"].value_counts().sort_index())
+            print("Weighting method selection:", best_params_df["best_weighting_method"].value_counts().sort_index())
 
             out["best_params_df"] = best_params_df
         else:
@@ -866,6 +895,7 @@ class WalkForwardRunner:
                         test_end=test_end,
                         simple_window=getattr(params, "simple_window", None),
                         vol_window=getattr(params, "vol_window", None),
+                        weighting_method=getattr(params, "weighting_method", None),
                         oos_sharpe=compute_sharpe(oos_ret, periods_per_year=per_year),
                         oos_sortino=compute_sortino_ratio(oos_ret, periods_per_year=per_year),
                         oos_calmar=compute_calmar_ratio(oos_ret, oos_eq, periods_per_year=per_year),
