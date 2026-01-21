@@ -67,11 +67,13 @@ class DataBundle:
         price_df: pd.DataFrame,
         rolling_volume_df: Optional[pd.DataFrame] = None,
         btc_ret: Optional[pd.Series] = None,
+        funding_df: Optional[pd.DataFrame] = None,
         min_hist_days: int = 30,
     ):
         self.price_df = price_df
         self.rolling_volume_df = rolling_volume_df
         self.btc_ret = btc_ret
+        self.funding_df = funding_df
         self.min_hist_days = min_hist_days
 
         self.price_np = price_df.to_numpy(dtype=float)
@@ -91,6 +93,11 @@ class DataBundle:
             rolling_volume_df.to_numpy(dtype=float) if rolling_volume_df is not None else None
         )
         self.btc_ret_np = btc_ret.to_numpy(dtype=float) if btc_ret is not None else None
+        if funding_df is not None:
+            funding_aligned = funding_df.reindex(index=price_df.index, columns=price_df.columns)
+            self.funding_np = funding_aligned.to_numpy(dtype=float)
+        else:
+            self.funding_np = None
 
     def ensure_simple_returns(self, windows: List[int]) -> None:
         for w in windows:
@@ -440,7 +447,13 @@ class BacktestEngine:
 
             turnover = np.abs(weights - prev_w).sum()
             fwd = b.forward_returns[i]
-            daily_ret = np.nansum(weights * fwd) - turnover * (self.params.tc_bps / 10000.0 if hasattr(self.params, "tc_bps") else self.tc_bps / 10000.0)
+            funding_cost = 0.0
+            if getattr(b, "funding_np", None) is not None and next_i < b.funding_np.shape[0]:
+                funding_row = b.funding_np[next_i]
+                # Funding: longs pay when rate > 0, shorts pay when rate < 0 -> -weight * rate
+                funding_cost = -np.nansum(weights * funding_row)
+            tc_cost = turnover * (self.params.tc_bps / 10000.0 if hasattr(self.params, "tc_bps") else self.tc_bps / 10000.0)
+            daily_ret = np.nansum(weights * fwd) + funding_cost - tc_cost
             equity *= (1.0 + daily_ret)
 
             equity_path.append(equity)
@@ -793,6 +806,9 @@ class WalkForwardRunner:
             agg_score = select_score(oos_returns, combined_equity, mode=self.score_mode, periods_per_year=per_year)
             agg_total_ret = combined_equity.iloc[-1] - 1
             agg_cagr = (combined_equity.iloc[-1] ** (per_year / len(combined_equity)) - 1) if len(combined_equity) else float("nan")
+            
+            traded_rets = oos_returns[oos_returns != 0]
+            agg_win_rate = (traded_rets > 0).mean() if not traded_rets.empty else float("nan")
 
             print("=" * 80)
             print("AGGREGATED OUT-OF-SAMPLE PERFORMANCE")
@@ -809,6 +825,7 @@ class WalkForwardRunner:
             print("--- Absolute ---")
             print(f"Total Return: {agg_total_ret*100:.2f}%")
             print(f"CAGR:         {agg_cagr*100:.2f}%")
+            print(f"Win Rate:     {agg_win_rate*100:.2f}%")
             print(f"Max Drawdown: {max_dd*100:.2f}%")
 
             out.update(
@@ -820,6 +837,7 @@ class WalkForwardRunner:
                     agg_score=agg_score,
                     agg_total_return=agg_total_ret,
                     agg_cagr=agg_cagr,
+                    agg_win_rate=agg_win_rate,
                     agg_max_dd=max_dd,
                     combined_equity=combined_equity,
                     combined_drawdown=drawdown,
@@ -888,6 +906,9 @@ class WalkForwardRunner:
                 combined_dates.extend(oos_ret.index)
                 combined_turnover.extend(oos_turn.values)
 
+                iter_traded = oos_ret[oos_ret != 0]
+                iter_win_rate = (iter_traded > 0).mean() if not iter_traded.empty else float("nan")
+
                 iter_stats.append(
                     dict(
                         iteration=row.iteration,
@@ -901,6 +922,7 @@ class WalkForwardRunner:
                         oos_calmar=compute_calmar_ratio(oos_ret, oos_eq, periods_per_year=per_year),
                         oos_composite=compute_composite_score(oos_ret, oos_eq, periods_per_year=per_year),
                         oos_total_return=oos_eq.iloc[-1] - 1,
+                        oos_win_rate=iter_win_rate,
                         oos_avg_turnover=oos_turn.mean(),
                     )
                 )

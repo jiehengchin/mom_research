@@ -33,6 +33,11 @@ class BinanceDataLoader:
         Start date for data filtering (YYYY-MM-DD format)
     end_date : str, optional
         End date for data filtering (YYYY-MM-DD format)
+    funding_rate_directory : str, optional
+        Directory containing funding rate parquet files. 
+        Note: Funding rates are only loaded for symbols that have valid price data 
+        loaded first (i.e., they must exist in the price data directory and pass 
+        volume/record filters).
     """
     
     def __init__(self, 
@@ -153,11 +158,17 @@ class BinanceDataLoader:
                         break
                 
                 # Skip futures contracts and weird symbols
-                if any(skip in symbol for skip in ['_250926', '_251226', 'BTCDOM']):
+                if any(skip in symbol for skip in ['_250926', '_251226', 'BTCDOM', 'USDCUSDT']):
                     continue
                 
                 # Load individual file
                 df = pd.read_parquet(file_path)
+
+                # OPTIMIZATION: Cast to float32 immediately to halve memory usage
+                float_cols = ['open', 'high', 'low', 'close', 'volume']
+                for col in float_cols:
+                    if col in df.columns:
+                        df[col] = df[col].astype('float32')
                 
                 if df.empty:
                     continue
@@ -181,6 +192,11 @@ class BinanceDataLoader:
                     print(f"Warning: {symbol} index could not be converted to datetime")
                     continue
                 
+                if df.index.has_duplicates:
+                    duplicates = df.index[df.index.duplicated()]
+                    print(f"Warning: Found duplicates in {symbol}. Dropping duplicates, keeping last. Duplicates:\n{duplicates}")
+                    df = df[~df.index.duplicated(keep='last')]
+
                 # Apply date filters
                 if self.start_date is not None:
                     df = df[df.index >= self.start_date]
@@ -238,37 +254,38 @@ class BinanceDataLoader:
         print(f"Date range: {self._returns_matrix.index.min()} to {self._returns_matrix.index.max()}")
     
     def _build_returns_matrix(self):
-        """Build unified returns matrix for all cryptocurrencies."""
+        """
+        Optimized matrix builder using concat (aligns indices automatically).
+        """
         if not self._crypto_universe:
             self._returns_matrix = pd.DataFrame()
             return
         
-        # Get all unique dates
-        all_dates = set()
-        for crypto in self._crypto_universe.values():
-            all_dates.update(crypto['data'].index)
-        all_dates = sorted(all_dates)
+        print("Building returns matrix (Memory Optimized)...")
         
-        tickers = list(self._crypto_universe.keys())
+        # 1. Collect Series objects (lightweight)
+        series_list = {}
+        for ticker, info in self._crypto_universe.items():
+            # Only keep 'close' to save memory during concat
+            s = info['data']['close']
+            if s.index.has_duplicates:
+                duplicates = s.index[s.index.duplicated()].unique()
+                print(f"Warning: {ticker} has duplicate indices in build_returns_matrix. Dropping duplicates.")
+                print(f"Duplicate timestamps: {duplicates}")
+                s = s[~s.index.duplicated(keep='last')]
+            series_list[ticker] = s
         
-        print(f"Building returns matrix for {len(tickers)} tickers over {len(all_dates)} dates...")
+        # 2. Concat all at once (Fastest way to align dates)
+        # This replaces the slow loop + reindex
+        self._price_matrix = pd.concat(series_list, axis=1)
         
-        # Create price matrix
-        price_matrix = pd.DataFrame(index=all_dates, columns=tickers)
+        # 3. Sort index
+        self._price_matrix.sort_index(inplace=True)
         
-        for ticker, crypto in self._crypto_universe.items():
-            data = crypto['data']
-            # Handle duplicate dates by keeping last occurrence
-            if data.index.duplicated().any():
-                data = data[~data.index.duplicated(keep='last')]
-            
-            price_matrix[ticker] = data['close'].reindex(all_dates)
+        # 4. Compute returns (keep as float32)
+        self._returns_matrix = self._price_matrix.pct_change(fill_method=None).astype('float32')
         
-        # Calculate returns matrix
-        self._returns_matrix = price_matrix.pct_change(fill_method=None)
-        
-        # Store price matrix for later use
-        self._price_matrix = price_matrix
+        print(f"Matrix shape: {self._returns_matrix.shape}")
     
     def get_universe(self) -> List[str]:
         """Get list of all available tickers."""
@@ -285,6 +302,47 @@ class BinanceDataLoader:
         if not hasattr(self, '_price_matrix') or self._price_matrix is None:
             self._build_returns_matrix()
         return self._price_matrix
+
+    def get_volume_matrix(self, vol_30d: bool = False) -> pd.DataFrame:
+        """
+        Get the unified volume matrix (dollar volume).
+        
+        Parameters:
+        -----------
+        vol_30d : bool, default False
+            If True, returns the 30-day rolling average dollar volume.
+            If False, returns the raw daily dollar volume.
+        """
+        if not self._crypto_universe:
+            return pd.DataFrame()
+            
+        col_name = 'volume_30d' if vol_30d else 'volume'
+        
+        # Get all unique dates
+        if self._returns_matrix is not None:
+            all_dates = self._returns_matrix.index
+        else:
+            all_dates = set()
+            for crypto in self._crypto_universe.values():
+                all_dates.update(crypto['data'].index)
+            all_dates = sorted(all_dates)
+            
+        tickers = list(self._crypto_universe.keys())
+        
+        print(f"Building volume matrix ({col_name}) for {len(tickers)} tickers over {len(all_dates)} dates...")
+        
+        # Create volume matrix
+        volume_matrix = pd.DataFrame(index=all_dates, columns=tickers)
+        
+        for ticker, crypto in self._crypto_universe.items():
+            data = crypto['data']
+            # Handle duplicate dates
+            if data.index.duplicated().any():
+                data = data[~data.index.duplicated(keep='last')]
+                
+            volume_matrix[ticker] = data[col_name].reindex(all_dates)
+            
+        return volume_matrix
     
     def get_daily_eligible_universe(self, min_volume_30d: float = 1e6, min_market_cap_30d: float = None) -> Dict[str, List[str]]:
         """
@@ -323,12 +381,21 @@ class BinanceDataLoader:
             volume_matrix.notna()
         )
         
-        # Convert to daily dictionary
+        # Convert to daily dictionary - aggregate by date
+        # For intraday data, a ticker is eligible if it meets threshold at ANY point
         daily_eligible = {}
         for date in all_dates:
             date_str = date.strftime('%Y-%m-%d')
             eligible_tickers = eligible_matrix.loc[date]
-            daily_eligible[date_str] = eligible_tickers[eligible_tickers].index.tolist()
+            tickers_list = eligible_tickers[eligible_tickers].index.tolist()
+            
+            # Merge with existing tickers for this date (for intraday data)
+            if date_str in daily_eligible:
+                existing = set(daily_eligible[date_str])
+                existing.update(tickers_list)
+                daily_eligible[date_str] = list(existing)
+            else:
+                daily_eligible[date_str] = tickers_list
         
         # Cache results
         self._daily_universe_cache[cache_key] = daily_eligible
@@ -445,7 +512,7 @@ class BinanceDataLoader:
         return data
     
     def _load_funding_rates(self):
-        """Load funding rate data from parquet files."""
+        """Load funding rate data from parquet files (including interval hours)."""
         print(f"Loading funding rate data from {self.funding_rate_directory}...")
         
         pattern = os.path.join(self.funding_rate_directory, "*USDT-funding-data.parquet")
@@ -467,26 +534,31 @@ class BinanceDataLoader:
                 if symbol not in self._crypto_universe:
                     continue
                 
-                # Load funding rate data
+                # Load funding rate data (now includes fundingIntervalHours)
                 df = pd.read_parquet(file_path)
                 
                 if df.empty:
                     continue
                 
-                # Filter to 00:00 UTC funding rates only
-                df_00 = df[df.index.hour == 0].copy()
+                # Round to nearest hour to align timestamps (e.g. 08:00:02 -> 08:00:00)
+                df.index = df.index.round('h')
                 
                 # Filter out records with invalid funding rates only
-                df_00 = df_00[df_00['fundingRate'].notna()].copy()
-                
+                df_filtered = df[df['fundingRate'].notna()].copy()
+
+                # Ensure interval hours (and rate) are numeric for downstream matrix building
+                for col in ['fundingRate', 'fundingIntervalHours']:
+                    if col in df_filtered.columns:
+                        df_filtered[col] = pd.to_numeric(df_filtered[col], errors='coerce')
+
                 # Apply date filters
                 if self.start_date is not None:
-                    df_00 = df_00[df_00.index >= self.start_date]
+                    df_filtered = df_filtered[df_filtered.index >= self.start_date]
                 if self.end_date is not None:
-                    df_00 = df_00[df_00.index <= self.end_date]
+                    df_filtered = df_filtered[df_filtered.index <= self.end_date]
                 
-                if not df_00.empty:
-                    self._funding_rate_data[symbol] = df_00
+                if not df_filtered.empty:
+                    self._funding_rate_data[symbol] = df_filtered
                     
             except Exception as e:
                 print(f"Warning: Failed to load funding rate for {file_path}: {e}")
@@ -494,39 +566,76 @@ class BinanceDataLoader:
         
         print(f"Loaded funding rates for {len(self._funding_rate_data)} symbols")
     
-    def get_funding_rate_matrix(self) -> pd.DataFrame:
-        """Get unified funding rate matrix (00:00 UTC only)."""
+    def _build_funding_matrix(self, column_name: str) -> pd.DataFrame:
+        """Helper to build a funding-related matrix for a given column."""
         if not self._funding_rate_data:
             return pd.DataFrame()
+
+        # Keep only symbols that actually have the requested column
+        valid_symbols = [s for s, df in self._funding_rate_data.items() if column_name in df.columns]
+        if not valid_symbols:
+            return pd.DataFrame()
         
-        # Get all unique dates from funding rate data and normalize timestamps
-        all_dates = set()
-        for data in self._funding_rate_data.values():
-            # Normalize timestamps to midnight (remove microseconds)
-            normalized_dates = data.index.normalize()
-            all_dates.update(normalized_dates)
-        all_dates = sorted(all_dates)
+        # Get all unique timestamps from funding rate data
+        all_timestamps = set()
+        for symbol in valid_symbols:
+            all_timestamps.update(self._funding_rate_data[symbol].index)
+        all_timestamps = sorted(all_timestamps)
         
-        tickers = list(self._funding_rate_data.keys())
+        print(f"Building {column_name} matrix with {len(all_timestamps)} timestamps and {len(valid_symbols)} tickers")
         
-        print(f"Building funding rate matrix with {len(all_dates)} dates and {len(tickers)} tickers")
+        # Create funding matrix for the requested column
+        matrix = pd.DataFrame(index=all_timestamps, columns=valid_symbols)
         
-        # Create funding rate matrix
-        funding_matrix = pd.DataFrame(index=all_dates, columns=tickers)
-        
-        for ticker, data in self._funding_rate_data.items():
-            # Normalize the data index to midnight
-            data_normalized = data.copy()
-            data_normalized.index = data_normalized.index.normalize()
+        for ticker in valid_symbols:
+            data = self._funding_rate_data[ticker]
+            # Handle duplicate timestamps by keeping last occurrence
+            if data.index.duplicated().any():
+                data = data[~data.index.duplicated(keep='last')]
             
-            # Handle duplicate dates by keeping last occurrence
-            if data_normalized.index.duplicated().any():
-                data_normalized = data_normalized[~data_normalized.index.duplicated(keep='last')]
-            
-            funding_matrix[ticker] = data_normalized['fundingRate'].reindex(all_dates)
+            matrix[ticker] = data[column_name].reindex(all_timestamps)
         
-        print(f"Funding rate matrix final shape: {funding_matrix.shape}")
-        return funding_matrix
+        print(f"{column_name} matrix final shape: {matrix.shape}")
+        return matrix
+
+    def get_funding_rate_matrix(self) -> pd.DataFrame:
+        """Get unified funding rate matrix."""
+        return self._build_funding_matrix('fundingRate')
+
+    def get_funding_interval_matrix(self) -> pd.DataFrame:
+        """Get unified funding interval matrix (hours)."""
+        return self._build_funding_matrix('fundingIntervalHours')
+
+    def get_funding_long_form(self) -> pd.DataFrame:
+        """Return funding data as a MultiIndex (symbol, timestamp) with rate and interval columns."""
+        if not self._funding_rate_data:
+            return pd.DataFrame(columns=['fundingRate', 'fundingIntervalHours'])
+
+        records = []
+        for symbol, df in self._funding_rate_data.items():
+            if df.empty:
+                continue
+
+            # Remove duplicate timestamps to avoid ambiguous index entries
+            data = df[~df.index.duplicated(keep='last')].copy()
+
+            # Ensure both columns exist even if absent in file
+            for col in ['fundingRate', 'fundingIntervalHours']:
+                if col not in data.columns:
+                    data[col] = np.nan
+
+            # Keep only the relevant columns
+            subset = data[['fundingRate', 'fundingIntervalHours']].copy()
+            subset['symbol'] = symbol
+            subset['timestamp'] = subset.index
+            records.append(subset)
+
+        if not records:
+            return pd.DataFrame(columns=['fundingRate', 'fundingIntervalHours'])
+
+        long_df = pd.concat(records, axis=0)
+        long_df = long_df.set_index(['symbol', 'timestamp']).sort_index()
+        return long_df[['fundingRate', 'fundingIntervalHours']]
     
     def get_funding_rate_for_date(self, date: pd.Timestamp) -> pd.Series:
         """Get funding rates for all symbols on a specific date."""
